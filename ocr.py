@@ -50,7 +50,8 @@ MODELS = [cfg.gemini_model] + [
 ]
 
 
-async def read_invoice(image: bytes, mime: str = "image/jpeg") -> Invoice:
+async def extract(contents: list, schema: type[BaseModel]) -> BaseModel:
+    """Gemini'dan `schema` ko'rinishidagi JSON olish; band model bo'lsa keyingisiga o'tadi."""
     if _client is None:
         raise RuntimeError("GEMINI_API_KEY .env faylida yo'q")
     last_err = None
@@ -58,10 +59,10 @@ async def read_invoice(image: bytes, mime: str = "image/jpeg") -> Invoice:
         try:
             resp = await _client.aio.models.generate_content(
                 model=model,
-                contents=[types.Part.from_bytes(data=image, mime_type=mime), PROMPT],
+                contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=Invoice,
+                    response_schema=schema,
                     temperature=0,
                 ),
             )
@@ -74,8 +75,12 @@ async def read_invoice(image: bytes, mime: str = "image/jpeg") -> Invoice:
     else:
         raise RuntimeError(f"Gemini hozir javob bermayapti: {last_err}")
     if resp.parsed is None:
-        return Invoice.model_validate_json(resp.text)
+        return schema.model_validate_json(resp.text)
     return resp.parsed
+
+
+async def read_invoice(image: bytes, mime: str = "image/jpeg") -> Invoice:
+    return await extract([types.Part.from_bytes(data=image, mime_type=mime), PROMPT], Invoice)
 
 
 def d(x) -> Decimal:

@@ -2,6 +2,7 @@
 import logging
 import re
 from datetime import date, datetime
+from datetime import time as dtime
 from decimal import Decimal, InvalidOperation
 from html import escape
 from pathlib import Path
@@ -18,6 +19,7 @@ import db
 from config import cfg
 from export_csv import build_csv
 from ocr import read_invoice
+import logistics
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -41,7 +43,13 @@ HELP = """<b>Qanday ishlaydi</b>
 <code>sana: 03.11.2026</code>
 <code>k: 5</code> — kontragent ID (/kontragentlar dan)
 <code>izoh: matn</code>
-<code>tayyor</code> — tuzatishni tugatish"""
+<code>tayyor</code> — tuzatishni tugatish
+
+<b>Logistika hisoboti</b>
+/guruh — (logistika guruhida yozing) shu guruhni kuzatish
+/hisobot_menga — kunlik hisobot shu chatga kelsin (har kuni 07:00)
+/hisobot — oxirgi kunlik hisobot (kecha 08:00 → bugun 07:00)
+/hisobot 09.11.2026 — shu kuni 07:00 da tugagan davr"""
 
 
 def allowed(update: Update) -> bool:
@@ -312,6 +320,68 @@ async def post_init(app: Application):
     await db.init()
 
 
+# ---------------- logistika ----------------
+
+async def cmd_guruh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Logistika guruhida yoziladi: bot shu guruh xabarlarini kuzata boshlaydi."""
+    if not allowed(update):
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Bu buyruqni logistika guruhining o‘zida yozing.")
+        return
+    await db.set_setting("logistics_chat_id", str(chat.id))
+    await update.message.reply_text(
+        "✅ Shu guruh kuzatiladi. Mashina jo‘natilgani haqidagi xabarlar kunlik hisobotga kiradi.")
+
+
+async def cmd_hisobot_menga(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await db.set_setting("report_chat_id", str(update.effective_chat.id))
+    await update.message.reply_text(
+        f"✅ Kunlik hisobot shu chatga har kuni {cfg.report_end_hour:02d}:00 da keladi.")
+
+
+async def cmd_hisobot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    if ctx.args:
+        try:
+            end_day = datetime.strptime(ctx.args[0], "%d.%m.%Y").date()
+        except ValueError:
+            await update.message.reply_text("Sana formati: /hisobot 09.11.2026")
+            return
+    else:
+        end_day = logistics.last_window_end_day()
+    wait = await update.message.reply_text("⏳ Hisobot tayyorlanmoqda...")
+    text = await logistics.build_report(end_day)
+    await wait.edit_text(text, parse_mode=ParseMode.HTML)
+
+
+async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or str(msg.chat_id) != await db.get_setting("logistics_chat_id"):
+        return
+    text = msg.text or msg.caption or ""
+    image = None
+    if msg.photo:
+        f = await msg.photo[-1].get_file()
+        image = bytes(await f.download_as_bytearray())
+    if not image and len(text.strip()) < 8:
+        return  # "ok", "+", stiker va h.k.
+    await logistics.handle_message(msg.chat_id, msg.message_id, msg.date, text, image)
+
+
+async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = await db.get_setting("report_chat_id")
+    if not chat_id:
+        log.warning("Hisobot chati belgilanmagan — botga /hisobot_menga yozing")
+        return
+    text = await logistics.build_report(logistics.last_window_end_day())
+    await ctx.bot.send_message(int(chat_id), text, parse_mode=ParseMode.HTML)
+
+
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     if isinstance(ctx.error, Conflict):
         log.error("Bot boshqa joyda ham ishlayapti — faqat bitta oynada ./run.sh qoldiring.")
@@ -341,11 +411,20 @@ def main():
     app.add_handler(CommandHandler("kontragent", cmd_add_k))
     app.add_handler(CommandHandler("kontragentlar", cmd_list_k))
     app.add_handler(CommandHandler("kontragent_ochir", cmd_del_k))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
+    app.add_handler(CommandHandler("guruh", cmd_guruh))
+    app.add_handler(CommandHandler("hisobot_menga", cmd_hisobot_menga))
+    app.add_handler(CommandHandler("hisobot", cmd_hisobot))
+    # Guruh xabarlari (yangi va tahrirlangan) — logistika uchun
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message))
+    # Shaxsiy chat — nakladnoy
+    private = filters.ChatType.PRIVATE
+    app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), on_photo))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
-    app.run_polling()
+    app.job_queue.run_daily(daily_report_job, time=dtime(cfg.report_end_hour, 0, tzinfo=logistics.TZ),
+                            name="kunlik_hisobot")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

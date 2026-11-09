@@ -21,6 +21,10 @@ class Config:
     nds: str = os.getenv("DEFAULT_NDS", "Без НДС")
     currency: str = os.getenv("DEFAULT_CURRENCY", "UZS")
     csv_delimiter: str = os.getenv("CSV_DELIMITER", ";")
+    # Logistika hisoboti: kechagi 08:00 -> bugungi 07:00, 07:00 da yuboriladi
+    timezone: str = os.getenv("TZ_NAME", "Asia/Tashkent")
+    report_start_hour: int = int(os.getenv("REPORT_START_HOUR", "8"))
+    report_end_hour: int = int(os.getenv("REPORT_END_HOUR", "7"))
 
 
 cfg = Config()

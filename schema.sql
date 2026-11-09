@@ -36,3 +36,22 @@ CREATE TABLE IF NOT EXISTS invoice_items (
 );
 
 CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices(status);
+
+-- Logistika guruhidagi jo'natma xabarlari
+CREATE TABLE IF NOT EXISTS shipments (
+    chat_id      BIGINT NOT NULL,
+    message_id   BIGINT NOT NULL,
+    sent_at      TIMESTAMPTZ NOT NULL,
+    raw_text     TEXT,
+    parsed_ok    BOOLEAN NOT NULL DEFAULT false,   -- Gemini o'qidimi
+    is_shipment  BOOLEAN,
+    parsed       JSONB,
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS shipments_sent_idx ON shipments(sent_at);
+
+-- Bot sozlamalari (logistika guruhi, hisobot chati)
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);

@@ -57,3 +57,17 @@ bilan ikki joyda ishlasa Telegram `Conflict` xatosini beradi.
 | `ocr.py` | Gemini’ga rasm yuborish, JSON sxema |
 | `db.py`, `schema.sql` | PostgreSQL |
 | `export_csv.py` | 1C uchun CSV |
+
+## Logistika: kunlik chiqim hisoboti
+
+Bot logistika guruhidagi "mashina chiqdi" xabarlarini o‘qiydi (Gemini) va har kuni
+**07:00** da kechagi 08:00 → bugungi 07:00 bo‘yicha hisobot yuboradi:
+o‘lchamlar bo‘yicha m³ va jami, kley (qop), paddon, xaridorlar bo‘yicha, manzillar.
+
+Sozlash (bir marta):
+1. @BotFather → `/setprivacy` → bot → **Disable** (aks holda bot guruh xabarlarini ko‘rmaydi).
+2. Botni logistika guruhiga qo‘shing va guruhda `/guruh` yozing.
+3. Botning shaxsiy chatida `/hisobot_menga` yozing.
+4. Istalgan payt: `/hisobot` yoki `/hisobot 09.11.2026`.
+
+m³: xabarda "kub/m3" bo‘lsa — shu olinadi; faqat dona bo‘lsa — o‘lcham (mm) × dona.

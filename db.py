@@ -132,3 +132,54 @@ async def mark_exported(ids: list[int]):
 
 def items_sum(items) -> Decimal:
     return sum((Decimal(str(i["amount"])) for i in items), Decimal(0))
+
+
+# ---------- sozlamalar ----------
+
+async def get_setting(key: str) -> str | None:
+    async with pool.connection() as c:
+        r = await (await c.execute("SELECT value FROM settings WHERE key=%s", (key,))).fetchone()
+        return r["value"] if r else None
+
+
+async def set_setting(key: str, value: str):
+    async with pool.connection() as c:
+        await c.execute(
+            "INSERT INTO settings (key, value) VALUES (%s,%s) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (key, value))
+
+
+# ---------- logistika ----------
+
+async def upsert_shipment_raw(chat_id, message_id, sent_at, text):
+    """Yangi yoki tahrirlangan xabar: matn yangilanadi va qayta o'qish uchun belgilanadi."""
+    async with pool.connection() as c:
+        await c.execute(
+            """INSERT INTO shipments (chat_id, message_id, sent_at, raw_text)
+               VALUES (%s,%s,%s,%s)
+               ON CONFLICT (chat_id, message_id) DO UPDATE
+               SET raw_text=EXCLUDED.raw_text, parsed_ok=false""",
+            (chat_id, message_id, sent_at, text))
+
+
+async def save_shipment_parsed(chat_id, message_id, is_shipment: bool, parsed):
+    async with pool.connection() as c:
+        await c.execute(
+            """UPDATE shipments SET parsed_ok=true, is_shipment=%s, parsed=%s
+               WHERE chat_id=%s AND message_id=%s""",
+            (is_shipment, parsed, chat_id, message_id))
+
+
+async def unparsed_shipments(start, end) -> list[dict]:
+    async with pool.connection() as c:
+        return await (await c.execute(
+            "SELECT * FROM shipments WHERE NOT parsed_ok AND sent_at >= %s AND sent_at < %s",
+            (start, end))).fetchall()
+
+
+async def shipments_between(start, end) -> list[dict]:
+    async with pool.connection() as c:
+        return await (await c.execute(
+            """SELECT * FROM shipments WHERE parsed_ok AND is_shipment
+               AND sent_at >= %s AND sent_at < %s ORDER BY sent_at""",
+            (start, end))).fetchall()
