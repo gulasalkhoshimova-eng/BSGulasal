@@ -1,0 +1,6 @@
+python-telegram-bot==21.*
+google-genai>=1.0
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+rapidfuzz>=3.0
+python-dotenv>=1.0
