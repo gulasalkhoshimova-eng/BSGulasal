@@ -1,6 +1,7 @@
 """Logistika guruhidan kunlik / haftalik / 15 kunlik / oylik chiqim hisoboti. Telegram bot."""
 import calendar
 import logging
+import re
 import time as _time
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
@@ -17,7 +18,8 @@ from telegram.ext import (
 import db
 import report
 from config import cfg
-from parser import TZ, last_closed_day, parse, split_phone, work_day
+from parser import TZ, Dispatch, last_closed_day, parse, split_phone, work_day
+from quick_parser import quick_parse
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -76,27 +78,33 @@ async def notify(bot, ids, text: str, **kw):
 
 async def send_summary(bot, s: report.Summary, ids, prefix: str = ""):
     data = report.excel(s)
-    cap = (prefix + "\n" if prefix else "") + report.caption(s)
+    head = prefix + "\n" if prefix else ""
+    cap = head + report.caption(s, limit=1024 - len(head))
     for uid in ids:
         try:
             await bot.send_document(uid, InputFile(data, filename=report.filename(s)),
-                                    caption=cap[:1024], parse_mode=ParseMode.HTML)
+                                    caption=cap, parse_mode=ParseMode.HTML)
         except Exception as e:  # noqa: BLE001
             log.warning("Hisobot yuborilmadi %s: %s", uid, e)
 
 
 async def process(chat_id: int, message_id: int) -> str:
-    """Bazadagi xabarni Gemini bilan o'qib, holatini qaytaradi: ok / not_shipment / failed."""
+    """Xabarni o'qiydi: avval odatiy format (Gemini'siz), bo'lmasa Gemini.
+    Holatni qaytaradi: ok / not_shipment / failed."""
     d = await db.get_dispatch(chat_id, message_id)
     masked, _ = split_phone(d["raw_text"])
-    try:
-        res = await parse(masked)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Gemini xato (%s/%s): %s", chat_id, message_id, e)
-        await db.mark_failed(chat_id, message_id)
-        return "failed"
+    res, source = quick_parse(masked), "format"
+    if res is None and not re.search(r"\d", masked):
+        res, source = Dispatch(is_shipment=False), "format"   # raqamsiz xabar — jo'natma emas
+    if res is None:
+        try:
+            res, source = await parse(masked), "gemini"
+        except Exception as e:  # noqa: BLE001
+            log.warning("Gemini xato (%s/%s): %s", chat_id, message_id, e)
+            await db.mark_failed(chat_id, message_id)
+            return "failed"
     status = "ok" if res.is_shipment else "not_shipment"
-    await db.save_parsed(chat_id, message_id, status, res.model_dump())
+    await db.save_parsed(chat_id, message_id, status, {**res.model_dump(), "source": source})
     return status
 
 
@@ -386,17 +394,21 @@ async def cmd_bekor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def job_retry(ctx: ContextTypes.DEFAULT_TYPE):
     """Gemini avval o'qiy olmagan xabarlarni qayta o'qish (har 10 daqiqa)."""
+    late_days = set()
     for d in await db.to_retry(MAX_ATTEMPTS):
         status = await process(d["chat_id"], d["message_id"])
         if status == "ok":
             await react(ctx.bot, d["chat_id"], d["message_id"])
-            await resend_day_if_closed(ctx.bot, d["work_day"], "kechikib o‘qilgan xabar")
+            if d["status"] == "failed":          # avval o'qilmay qolgan -> hisobot o'zgaradi
+                late_days.add(d["work_day"])
         elif status == "failed" and d["attempts"] + 1 >= MAX_ATTEMPTS:
             link = report._link(d["chat_id"], d["message_id"])
             await notify(ctx.bot, await db.admins(),
                          "⚠️ Gemini bu xabarni 2 soat davomida o‘qiy olmadi — hisobotga kirmaydi:\n"
                          f"<i>{escape((d['raw_text'] or '')[:300])}</i>"
                          + (f"\n<a href=\"{link}\">Xabar</a>" if link else ""))
+    for day in sorted(x for x in late_days if x):
+        await resend_day_if_closed(ctx.bot, day, "kechikib o‘qilgan xabar")
 
 
 def due_reports(today: date) -> list[tuple[date, date, str]]:
@@ -446,8 +458,30 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
         await notify(ctx.bot, await db.admins(), f"⚠️ Botda xato: <code>{escape(str(ctx.error))[:300]}</code>")
 
 
+async def migrate_legacy():
+    """Oldingi versiyadan qolgan ma'lumotlarni ko'chirish (Railway bazasi uchun)."""
+    # 1) eski 'hisobot shu chatga' sozlamasi -> admin
+    old_chat = await db.get_setting("report_chat_id")
+    if old_chat and not await db.has_admin():
+        await db.add_user(int(old_chat), None, "admin")
+        log.info("Eski hisobot chati admin qilindi: %s", old_chat)
+    # 2) eski 'shipments' jadvalidagi guruh xabarlari -> dispatches (qayta o'qiladi)
+    if not await db._one("SELECT to_regclass('public.shipments') AS t WHERE to_regclass('public.shipments') IS NOT NULL"):
+        return
+    rows = await db._all("""SELECT s.chat_id, s.message_id, s.sent_at, s.raw_text FROM shipments s
+                            LEFT JOIN dispatches d USING (chat_id, message_id)
+                            WHERE d.chat_id IS NULL AND s.raw_text IS NOT NULL""")
+    for r in rows:
+        _, phone = split_phone(r["raw_text"])
+        await db.upsert_raw(r["chat_id"], r["message_id"], r["sent_at"], work_day(r["sent_at"]),
+                            r["raw_text"], phone)
+    if rows:
+        log.info("Eski versiyadan %d ta xabar ko'chirildi", len(rows))
+
+
 async def post_init(app: Application):
     await db.init()
+    await migrate_legacy()
     await app.bot.set_my_commands([
         ("hisobot", "Oxirgi kunlik hisobot"), ("bugun", "Joriy kun (hozirgacha)"),
         ("hafta", "O‘tgan hafta"), ("yarim_oy", "Oxirgi 15 kun"), ("oy", "O‘tgan oy"),

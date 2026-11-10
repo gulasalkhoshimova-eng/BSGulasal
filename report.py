@@ -173,7 +173,7 @@ def fmt(x) -> str:
     return f"{x:,}".replace(",", " ")
 
 
-def caption(s: Summary) -> str:
+def caption(s: Summary, limit: int = 1024) -> str:
     lines = [f"📦 <b>{s.title}</b>",
              f"{s.start:%d.%m %H:%M} → {s.end:%d.%m %H:%M}", ""]
     if not s.rows:
@@ -203,7 +203,7 @@ def caption(s: Summary) -> str:
         lines.append(f"⚠️ {warn} ta qatorda m³ yozilmagan (Excel'da «Mashinalar» varag'i)")
     lines.append("\nBatafsil — Excel faylda.")
     # Telegram caption chegarasi 1024 belgi: sig'masa o'lchamlar/xaridorlar qisqartiriladi
-    while len("\n".join(lines)) > 1024:
+    while len("\n".join(lines)) > limit:
         idx = next((i for i, l in enumerate(lines) if l.startswith(("\n👥", "▫️"))), None)
         if idx is None:
             break

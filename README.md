@@ -28,7 +28,9 @@ Xojakbar mega qurilish mchj
 Surxondaryo denov
 ```
 
-Telefon raqam Gemini’ga yuborilmaydi — lokal ajratiladi va faqat Excel’da ko‘rinadi.
+Odatiy formatdagi xabarni bot **Gemini’siz** o‘qiydi (`quick_parser.py`) — tez, bepul va
+Gemini band/kvota tugagan paytda ham ishlaydi. Gemini faqat odatdan tashqari yozilgan xabarlar
+uchun ishlatiladi. Telefon raqam Gemini’ga yuborilmaydi — faqat Excel’da ko‘rinadi.
 
 ## Sozlash (bir marta)
 
@@ -65,6 +67,7 @@ Railway: GitHub repo’dan deploy + PostgreSQL. Variables:
 | Fayl | Vazifa |
 |---|---|
 | `bot.py` | Telegram: guruh, buyruqlar, foydalanuvchilar, jadval |
-| `parser.py` | Gemini bilan xabarni o‘qish, telefonni yashirish, ish kuni |
+| `quick_parser.py` | Odatiy formatni Gemini’siz o‘qish |
+| `parser.py` | Gemini bilan o‘qish (zaxira), telefonni yashirish, ish kuni |
 | `report.py` | Hisob-kitob, Excel, qisqa matn |
 | `db.py`, `schema.sql` | PostgreSQL |
