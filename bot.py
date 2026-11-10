@@ -1,429 +1,498 @@
-"""Nakladnoy rasmi -> Gemini -> PostgreSQL -> 1C uchun CSV. Telegram bot."""
+"""Logistika guruhidan kunlik / haftalik / 15 kunlik / oylik chiqim hisoboti. Telegram bot."""
+import calendar
 import logging
-import re
-from datetime import date, datetime
+import time as _time
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
-from decimal import Decimal, InvalidOperation
 from html import escape
 from pathlib import Path
 
-from telegram.error import Conflict
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ParseMode
+from telegram.error import Conflict
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
 import db
+import report
 from config import cfg
-from export_csv import build_csv
-from ocr import read_invoice
-import logistics
+from parser import TZ, last_closed_day, parse, split_phone, work_day
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-HELP = """<b>Qanday ishlaydi</b>
-1. Nakladnoy rasmini yuboring (bir nechtasini ketma-ket ham bo‘ladi).
-2. Bot o‘qib, tekshirish uchun ko‘rsatadi → <b>✅ Tasdiqlash</b> yoki <b>✏️ Tuzatish</b>.
-3. Kun oxirida /csv — tasdiqlangan barcha nakladnoylar bitta CSV faylda.
+MAX_ATTEMPTS = 12          # Gemini'ga qayta urinishlar (har 10 daqiqada) ≈ 2 soat
+
+HELP = """<b>Logistika hisobot boti</b>
+
+Bot logistika guruhidagi omborchi xabarlarini o‘qiydi va hisobot yuboradi:
+• har kuni <b>07:00</b> — kunlik (kecha 08:00 → bugun 07:00)
+• har <b>dushanba</b> — haftalik
+• har oyning <b>16</b>- va <b>1</b>-kuni — 15 kunlik
+• har oyning <b>1</b>-kuni — oylik
 
 <b>Buyruqlar</b>
-/csv — tasdiqlangan, hali yuklanmagan nakladnoylar
-/csv 03.11.2026 — faqat shu kuni yuborilganlar
-/kontragent Nomi | INN | Договор | taxallus1, taxallus2
-/kontragentlar — ro‘yxat (ID bilan)
-/kontragent_ochir ID
+/hisobot — oxirgi kunlik hisobot
+/hisobot 09.11.2026 — shu ish kuni (09.11 08:00 → 10.11 07:00)
+/bugun — joriy kun (hozirgacha)
+/hafta — o‘tgan hafta
+/yarim_oy — oxirgi 15 kunlik
+/oy — o‘tgan oy
+/obuna — avtomatik hisobotni yoqish/o‘chirish
 
-<b>Tuzatish rejimida</b> (har biri alohida qator):
-<code>3; Офис папка; шт; 2; 40000</code> — 3-qatorni almashtirish/qo‘shish
-<code>-3</code> — 3-qatorni o‘chirish
-<code>sana: 03.11.2026</code>
-<code>k: 5</code> — kontragent ID (/kontragentlar dan)
-<code>izoh: matn</code>
-<code>tayyor</code> — tuzatishni tugatish
+<b>Guruhda</b>
+/guruh — shu guruhni kuzatish (bir marta)
+Noto‘g‘ri xabarga <b>javob (reply)</b> qilib /bekor — hisobotdan chiqarish"""
 
-<b>Logistika hisoboti</b>
-/guruh — (logistika guruhida yozing) shu guruhni kuzatish
-/hisobot_menga — kunlik hisobot shu chatga kelsin (har kuni 07:00)
-/hisobot — oxirgi kunlik hisobot (kecha 08:00 → bugun 07:00)
-/hisobot 09.11.2026 — shu kuni 07:00 da tugagan davr"""
+ADMIN_HELP = """
 
-
-def allowed(update: Update) -> bool:
-    return not cfg.allowed_users or update.effective_user.id in cfg.allowed_users
+<b>Admin</b>
+/foydalanuvchilar — ro‘yxat
+/olib_tashlash ID — foydalanuvchini o‘chirish
+/holat — bot holati"""
 
 
-def money(x) -> str:
-    v = Decimal(str(x))
-    s = f"{v:,.2f}".replace(",", " ")
-    return s[:-3] if s.endswith(".00") else s
+# ================= yordamchilar =================
+
+async def is_member(uid: int) -> bool:
+    return uid in cfg.allowed_users or await db.get_user(uid) is not None
 
 
-def qty_str(x) -> str:
-    return format(Decimal(str(x)).normalize(), "f")
+async def is_admin(uid: int) -> bool:
+    u = await db.get_user(uid)
+    return bool(u and u["role"] == "admin")
 
 
-def preview(inv: dict) -> str:
-    lines = [f"<b>Nakladnoy #{inv['id']}</b>  ({escape(inv['status'])})"]
-    dt = inv["doc_date"].strftime("%d.%m.%Y") if inv["doc_date"] else "❓"
-    lines.append(f"Sana: <b>{dt}</b>")
-    lines.append(f"Kimdan (rasmda): {escape(inv['supplier_raw'] or '')}")
-    if inv.get("k_name"):
-        lines.append(f"1C kontragent: <b>{escape(inv['k_name'])}</b>")
-        lines.append(f"Договор: {escape(inv['k_contract'] or '—')}")
-    else:
-        lines.append("⚠️ <b>Kontragent topilmadi</b> — ✏️ orqali <code>k: ID</code> kiriting")
-    if inv.get("comment"):
-        lines.append(f"Izoh: {escape(inv['comment'])}")
-    lines.append("")
-    warn = []
-    for it in inv["items"]:
-        lines.append(
-            f"{it['line_no']}. {escape(it['name'])} — {qty_str(it['qty'])} {escape(it['unit'] or '')}"
-            f" × {money(it['price'])} = <b>{money(it['amount'])}</b>"
-        )
-        calc = Decimal(str(it["qty"])) * Decimal(str(it["price"]))
-        if abs(calc - Decimal(str(it["amount"]))) > 1:
-            warn.append(f"{it['line_no']}-qator: {qty_str(it['qty'])}×{money(it['price'])}={money(calc)}, "
-                        f"lekin yozilgan {money(it['amount'])}")
-    s = db.items_sum(inv["items"])
-    lines.append(f"\nJami: <b>{money(s)}</b> so‘m")
-    if inv["total"] is not None and abs(s - Decimal(str(inv["total"]))) > 1:
-        warn.append(f"Rasmdagi «Итого» {money(inv['total'])}, qatorlar yig‘indisi {money(s)}")
-    if warn:
-        lines.append("\n⚠️ <b>Tekshiring:</b>\n" + "\n".join("• " + escape(w) for w in warn))
-    return "\n".join(lines)
+async def notify(bot, ids, text: str, **kw):
+    for uid in ids:
+        try:
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True, **kw)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Xabar yuborilmadi %s: %s", uid, e)
 
 
-def buttons(inv_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"ok:{inv_id}"),
-        InlineKeyboardButton("✏️ Tuzatish", callback_data=f"edit:{inv_id}"),
-        InlineKeyboardButton("❌ Bekor", callback_data=f"no:{inv_id}"),
-    ]])
+async def send_summary(bot, s: report.Summary, ids, prefix: str = ""):
+    data = report.excel(s)
+    cap = (prefix + "\n" if prefix else "") + report.caption(s)
+    for uid in ids:
+        try:
+            await bot.send_document(uid, InputFile(data, filename=report.filename(s)),
+                                    caption=cap[:1024], parse_mode=ParseMode.HTML)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Hisobot yuborilmadi %s: %s", uid, e)
 
 
-async def show(target, inv_id: int):
-    inv = await db.get_invoice(inv_id)
-    await target.reply_text(preview(inv), parse_mode=ParseMode.HTML, reply_markup=buttons(inv_id))
-
-
-# ---------------- handlers ----------------
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not allowed(update):
-        await update.message.reply_text(f"Ruxsat yo‘q. Sizning ID: {uid}")
-        return
-    await update.message.reply_text(f"Sizning Telegram ID: <code>{uid}</code>\n\n{HELP}",
-                                    parse_mode=ParseMode.HTML)
-
-
-async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    msg = update.message
-    if msg.photo:
-        tg_file, mime = await msg.photo[-1].get_file(), "image/jpeg"
-    else:
-        tg_file, mime = await msg.document.get_file(), msg.document.mime_type or "image/jpeg"
-    wait = await msg.reply_text("⏳ O‘qilmoqda...")
+async def process(chat_id: int, message_id: int) -> str:
+    """Bazadagi xabarni Gemini bilan o'qib, holatini qaytaradi: ok / not_shipment / failed."""
+    d = await db.get_dispatch(chat_id, message_id)
+    masked, _ = split_phone(d["raw_text"])
     try:
-        data = bytes(await tg_file.download_as_bytearray())
-        parsed = await read_invoice(data, mime)
+        res = await parse(masked)
     except Exception as e:  # noqa: BLE001
-        log.exception("OCR xato")
-        await wait.edit_text(f"❌ O‘qib bo‘lmadi: {e}\nRasmni aniqroq qilib qayta yuboring.")
-        return
-    if not parsed.items:
-        await wait.edit_text("❌ Rasmda tovar qatorlari topilmadi.")
-        return
-    raw = parsed.model_dump()
-    try:
-        raw_date = date.fromisoformat(parsed.date)
-    except ValueError:
-        raw_date = None
-    k = await db.match_contractor(parsed.supplier)
-    inv_id = await db.save_invoice(
-        update.effective_user.id,
-        {"date": raw_date, "number": parsed.number, "supplier": parsed.supplier,
-         "buyer": parsed.buyer, "total": parsed.total,
-         "items": [i.model_dump() for i in parsed.items]},
-        k["id"] if k else None, tg_file.file_id, raw,
-    )
-    await wait.delete()
-    await show(msg, inv_id)
+        log.warning("Gemini xato (%s/%s): %s", chat_id, message_id, e)
+        await db.mark_failed(chat_id, message_id)
+        return "failed"
+    status = "ok" if res.is_shipment else "not_shipment"
+    await db.save_parsed(chat_id, message_id, status, res.model_dump())
+    return status
 
 
-async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not allowed(update):
-        await q.answer("Ruxsat yo‘q")
-        return
-    action, inv_id = q.data.split(":")
-    inv_id = int(inv_id)
-    inv = await db.get_invoice(inv_id)
-    if not inv or inv["user_id"] != update.effective_user.id:
-        await q.answer("Topilmadi")
-        return
-    if inv["status"] == "exported":
-        await q.answer("Bu nakladnoy allaqachon CSV’ga chiqarilgan")
-        return
-    if action == "ok":
-        if not inv.get("k_name"):
-            await q.answer("Avval kontragentni belgilang (✏️ → k: ID)", show_alert=True)
-            return
-        await db.update_invoice(inv_id, status="confirmed")
-        ctx.user_data.pop("editing", None)
-        await q.answer("Tasdiqlandi")
-        await q.edit_message_text(preview(await db.get_invoice(inv_id)), parse_mode=ParseMode.HTML)
-    elif action == "no":
-        await db.update_invoice(inv_id, status="cancelled")
-        ctx.user_data.pop("editing", None)
-        await q.answer("Bekor qilindi")
-        await q.edit_message_text(f"❌ Nakladnoy #{inv_id} bekor qilindi.")
-    elif action == "edit":
-        await db.update_invoice(inv_id, status="draft")
-        ctx.user_data["editing"] = inv_id
-        await q.answer()
-        await q.message.reply_text(
-            f"✏️ #{inv_id} tuzatish rejimi. Tuzatishlarni yuboring, oxirida <code>tayyor</code>.\n"
-            "Format: <code>3; Офис папка; шт; 2; 40000</code>, <code>-3</code>, "
-            "<code>sana: 03.11.2026</code>, <code>k: 5</code>, <code>izoh: ...</code>",
-            parse_mode=ParseMode.HTML,
-        )
+def short(d: dict | None) -> str:
+    """Jo'natmaning bir qatorlik tavsifi."""
+    if not d or d.get("status") != "ok":
+        return "—"
+    r = report.to_row(d)
+    parts = [r.vehicle or "?", r.buyer or "?", f"{report.fmt(r.m3)} m³", f"{r.pallets} paddon"]
+    if r.kley:
+        parts.append(f"kley {r.kley} qop")
+    if r.rodgips:
+        parts.append(f"rodgips {r.rodgips} qop")
+    return ", ".join(escape(p) for p in parts)
 
 
-def _dec(s: str) -> Decimal:
-    """'250.000' / '250 000' -> 250000, '2,5' / '2.5' -> 2.5"""
-    s = s.strip().replace(" ", "")
-    if "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
-        s = s.replace(".", "")
-    return Decimal(s)
+async def resend_day_if_closed(bot, d: date | None, reason: str):
+    """Hisoboti allaqachon yuborilgan kun o'zgarsa — yangilangan hisobotni yuborish."""
+    if d and d <= last_closed_day():
+        s = await report.collect(d, d, report.day_title(d))
+        await send_summary(bot, s, await db.subscribers(), f"♻️ <b>Yangilangan hisobot</b> ({reason})")
 
 
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
+# ================= shaxsiy chat =================
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if update.effective_chat.type != "private":
         return
-    inv_id = ctx.user_data.get("editing")
-    if not inv_id:
-        await update.message.reply_text("Nakladnoy rasmini yuboring yoki /start ni bosing.")
-        return
-    inv = await db.get_invoice(inv_id)
-    items = {i["line_no"]: dict(i) for i in inv["items"]}
-    errors, changed = [], False
-    for line in update.message.text.splitlines():
-        line = line.strip()
-        low = line.lower()
-        if not line:
-            continue
-        try:
-            if low == "tayyor":
-                ctx.user_data.pop("editing", None)
-            elif low.startswith("sana:"):
-                await db.update_invoice(
-                    inv_id, doc_date=datetime.strptime(line[5:].strip(), "%d.%m.%Y").date())
-            elif low.startswith("k:"):
-                cid = int(line[2:].strip())
-                if not any(c["id"] == cid for c in await db.list_contractors()):
-                    raise ValueError(f"kontragent ID {cid} yo‘q")
-                await db.update_invoice(inv_id, contractor_id=cid)
-            elif low.startswith("izoh:"):
-                await db.update_invoice(inv_id, comment=line[5:].strip() or None)
-            elif line.startswith("-") and line[1:].strip().isdigit():
-                items.pop(int(line[1:]), None)
-                changed = True
-            else:
-                p = [x.strip() for x in line.split(";")]
-                if len(p) != 5:
-                    raise ValueError("5 ta qism kerak: N; nomi; birlik; soni; narxi")
-                qty, price = _dec(p[3]), _dec(p[4])
-                items[int(p[0])] = {"name": p[1], "unit": p[2], "qty": qty, "price": price,
-                                    "amount": qty * price}
-                changed = True
-        except (ValueError, InvalidOperation) as e:
-            errors.append(f"«{line}»: {e}")
-    if changed:
-        await db.replace_items(inv_id, [items[k] for k in sorted(items)])
-    if errors:
-        await update.message.reply_text("⚠️ Tushunmadim:\n" + "\n".join(errors))
-    await show(update.message, inv_id)
-
-
-async def cmd_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    day = None
-    if ctx.args:
-        try:
-            day = datetime.strptime(ctx.args[0], "%d.%m.%Y").date()
-        except ValueError:
-            await update.message.reply_text("Sana formati: /csv 03.11.2026")
-            return
-    invs = await db.pending_export(update.effective_user.id, day)
-    if not invs:
-        await update.message.reply_text("Tasdiqlangan, yuklanmagan nakladnoy yo‘q.")
-        return
-    data = build_csv(invs)
-    name = f"postuplenie_{datetime.now():%Y%m%d_%H%M}.csv"
-    total = sum(db.items_sum(i["items"]) for i in invs)
-    await update.message.reply_document(
-        InputFile(data, filename=name),
-        caption=f"{len(invs)} ta nakladnoy, jami {money(total)} so‘m",
-    )
-    await db.mark_exported([i["id"] for i in invs])
-
-
-async def cmd_add_k(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    text = update.message.text.partition(" ")[2]
-    p = [x.strip() for x in text.split("|")]
-    if not p or not p[0]:
+    if not await db.has_admin():
+        await db.add_user(u.id, u.full_name, "admin")
         await update.message.reply_text(
-            "Format: /kontragent Nomi | INN | Договор | taxallus1, taxallus2")
+            "👑 Siz botning <b>admini</b> bo‘ldingiz va hisobotlarga obuna qilindingiz.\n\n"
+            "Keyingi qadam: botni logistika guruhiga qo‘shing va guruhda /guruh yozing.\n\n"
+            + HELP + ADMIN_HELP, parse_mode=ParseMode.HTML)
         return
-    p += [""] * (4 - len(p))
-    aliases = [a.strip() for a in p[3].split(",") if a.strip()]
-    await db.add_contractor(p[0], p[1] or None, p[2] or None, aliases)
-    await update.message.reply_text(f"✅ Saqlandi: {p[0]}")
-
-
-async def cmd_list_k(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
+    if await is_member(u.id):
+        await db.add_user(u.id, u.full_name)
+        extra = ADMIN_HELP if await is_admin(u.id) else ""
+        await update.message.reply_text(HELP + extra, parse_mode=ParseMode.HTML)
         return
-    rows = await db.list_contractors()
-    if not rows:
-        await update.message.reply_text("Hali kontragent yo‘q. /kontragent bilan qo‘shing.")
-        return
-    out = [f"<code>{r['id']}</code> {escape(r['name'])} | {escape(r['inn'] or '')} | "
-           f"{escape(r['contract'] or '')}" for r in rows]
-    await update.message.reply_text("\n".join(out), parse_mode=ParseMode.HTML)
-
-
-async def cmd_del_k(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    if not ctx.args or not ctx.args[0].isdigit():
-        await update.message.reply_text("Format: /kontragent_ochir ID")
-        return
-    ok = await db.delete_contractor(int(ctx.args[0]))
-    await update.message.reply_text("O‘chirildi" if ok else "Topilmadi")
-
-
-async def post_init(app: Application):
-    await db.init()
-
-
-# ---------------- logistika ----------------
-
-async def cmd_guruh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Logistika guruhida yoziladi: bot shu guruh xabarlarini kuzata boshlaydi."""
-    if not allowed(update):
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Bu buyruqni logistika guruhining o‘zida yozing.")
-        return
-    await db.set_setting("logistics_chat_id", str(chat.id))
     await update.message.reply_text(
-        "✅ Shu guruh kuzatiladi. Mashina jo‘natilgani haqidagi xabarlar kunlik hisobotga kiradi.")
+        f"Bu bot yopiq. So‘rovingiz adminga yuborildi.\nSizning ID: <code>{u.id}</code>",
+        parse_mode=ParseMode.HTML)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Ruxsat berish", callback_data=f"allow:{u.id}"),
+        InlineKeyboardButton("❌ Rad etish", callback_data=f"deny:{u.id}"),
+    ]])
+    name = escape(u.full_name) + (f" (@{escape(u.username)})" if u.username else "")
+    await notify(ctx.bot, await db.admins(),
+                 f"🔔 <b>{name}</b> botdan foydalanmoqchi. ID: <code>{u.id}</code>", reply_markup=kb)
 
 
-async def cmd_hisobot_menga(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
+async def on_access_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not await is_admin(q.from_user.id):
+        await q.answer("Faqat admin")
         return
-    await db.set_setting("report_chat_id", str(update.effective_chat.id))
-    await update.message.reply_text(
-        f"✅ Kunlik hisobot shu chatga har kuni {cfg.report_end_hour:02d}:00 da keladi.")
+    action, uid = q.data.split(":")
+    uid = int(uid)
+    if action == "allow":
+        await db.add_user(uid, None)
+        await q.edit_message_text(f"✅ Ruxsat berildi: <code>{uid}</code>", parse_mode=ParseMode.HTML)
+        await notify(ctx.bot, [uid], "✅ Ruxsat berildi. Hisobotlar shu chatga keladi.\n\n" + HELP)
+    else:
+        await q.edit_message_text(f"❌ Rad etildi: <code>{uid}</code>", parse_mode=ParseMode.HTML)
+    await q.answer()
 
 
+def member_only(fn):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await is_member(update.effective_user.id):
+            await update.effective_message.reply_text("Ruxsat yo‘q. Avval /start yozing.")
+            return
+        return await fn(update, ctx)
+    return wrapper
+
+
+def admin_only(fn):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await is_admin(update.effective_user.id):
+            await update.effective_message.reply_text("Bu buyruq faqat admin uchun.")
+            return
+        return await fn(update, ctx)
+    return wrapper
+
+
+async def _reply_summary(update: Update, d1: date, d2: date, title: str):
+    wait = await update.message.reply_text("⏳ Tayyorlanmoqda...")
+    for d in await db.unread_between(d1, d2):
+        await process(d["chat_id"], d["message_id"])
+    s = await report.collect(d1, d2, title)
+    await wait.delete()
+    await send_summary(update.get_bot(), s, [update.effective_chat.id])
+
+
+@member_only
 async def cmd_hisobot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
     if ctx.args:
         try:
-            end_day = datetime.strptime(ctx.args[0], "%d.%m.%Y").date()
+            d = datetime.strptime(ctx.args[0], "%d.%m.%Y").date()
         except ValueError:
             await update.message.reply_text("Sana formati: /hisobot 09.11.2026")
             return
     else:
-        end_day = logistics.last_window_end_day()
-    wait = await update.message.reply_text("⏳ Hisobot tayyorlanmoqda...")
-    text = await logistics.build_report(end_day)
-    await wait.edit_text(text, parse_mode=ParseMode.HTML)
+        d = last_closed_day()
+    await _reply_summary(update, d, d, report.day_title(d))
+
+
+@member_only
+async def cmd_bugun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d = last_closed_day() + timedelta(days=1)
+    await _reply_summary(update, d, d, report.day_title(d) + " (hozirgacha)")
+
+
+def last_week() -> tuple[date, date]:
+    end = last_closed_day()
+    end -= timedelta(days=(end.weekday() + 1) % 7)       # oxirgi yakshanba
+    return end - timedelta(days=6), end
+
+
+def last_half() -> tuple[date, date]:
+    """Oxirgi to'liq yopilgan yarim oy: 1–15 yoki 16–oy oxiri."""
+    d = last_closed_day()
+    if d.day == calendar.monthrange(d.year, d.month)[1]:
+        return d.replace(day=16), d
+    if d.day >= 15:
+        return d.replace(day=1), d.replace(day=15)
+    prev = d.replace(day=1) - timedelta(days=1)
+    return prev.replace(day=16), prev
+
+
+def last_month() -> tuple[date, date]:
+    d = last_closed_day()
+    if d.day == calendar.monthrange(d.year, d.month)[1]:
+        return d.replace(day=1), d
+    prev = d.replace(day=1) - timedelta(days=1)
+    return prev.replace(day=1), prev
+
+
+@member_only
+async def cmd_hafta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d1, d2 = last_week()
+    await _reply_summary(update, d1, d2, report.period_title(d1, d2, "Haftalik chiqim"))
+
+
+@member_only
+async def cmd_yarim_oy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d1, d2 = last_half()
+    await _reply_summary(update, d1, d2, report.period_title(d1, d2, "15 kunlik chiqim"))
+
+
+@member_only
+async def cmd_oy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d1, d2 = last_month()
+    await _reply_summary(update, d1, d2, f"{report.OYLAR[d1.month].capitalize()} {d1.year} — oylik chiqim")
+
+
+@member_only
+async def cmd_obuna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = await db.get_user(update.effective_user.id)
+    if u is None:
+        await db.add_user(update.effective_user.id, update.effective_user.full_name)
+        on = True
+    else:
+        on = not u["subscribed"]
+        await db.set_subscribed(u["user_id"], on)
+    await update.message.reply_text("🔔 Avtomatik hisobotlar yoqildi." if on
+                                    else "🔕 Avtomatik hisobotlar o‘chirildi.")
+
+
+@admin_only
+async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = await db.list_users()
+    out = [f"{'👑' if r['role'] == 'admin' else '👤'} <code>{r['user_id']}</code> "
+           f"{escape(r['name'] or '')} {'🔔' if r['subscribed'] else '🔕'}" for r in rows]
+    await update.message.reply_text("\n".join(out) or "Bo‘sh", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or not ctx.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Format: /olib_tashlash ID")
+        return
+    ok = await db.remove_user(int(ctx.args[0]))
+    await update.message.reply_text("O‘chirildi" if ok else "Topilmadi (yoki admin)")
+
+
+@admin_only
+async def cmd_holat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    gid = await db.get_setting("logistics_chat_id")
+    retry = await db.to_retry(MAX_ATTEMPTS)
+    await update.message.reply_text(
+        f"Logistika guruhi: {'✅ ' + gid if gid else '❌ belgilanmagan (guruhda /guruh)'}\n"
+        f"Hisobot oluvchilar: {len(await db.subscribers())}\n"
+        f"O‘qilishi kutilayotgan xabarlar: {len(retry)}\n"
+        f"Joriy ish kuni: {last_closed_day() + timedelta(days=1):%d.%m.%Y}\n"
+        f"Gemini modeli: {cfg.gemini_model}")
+
+
+# ================= guruh =================
+
+async def cmd_guruh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Bu buyruqni logistika guruhining o‘zida yozing.")
+        return
+    if not await is_member(update.effective_user.id):
+        await update.message.reply_text("Faqat bot foydalanuvchisi guruhni ulay oladi.")
+        return
+    await db.set_setting("logistics_chat_id", str(chat.id))
+    await update.message.reply_text(
+        "✅ Guruh ulandi. Jo‘natma xabarlari hisobotga kiradi — bot o‘qigan xabarga 👍 qo‘yadi.\n"
+        "Noto‘g‘ri xabarni hisobotdan chiqarish: unga javob (reply) qilib /bekor yozing.")
+    await notify(ctx.bot, await db.admins(), f"✅ Logistika guruhi ulandi: <b>{escape(chat.title or '')}</b>")
+
+
+async def is_logistics(chat_id: int) -> bool:
+    return str(chat_id) == await db.get_setting("logistics_chat_id")
+
+
+async def react(bot, chat_id, message_id, emoji="👍"):
+    try:
+        await bot.set_message_reaction(chat_id, message_id, emoji)
+    except Exception:  # noqa: BLE001 — reaksiya muhim emas
+        pass
 
 
 async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if msg is None or str(msg.chat_id) != await db.get_setting("logistics_chat_id"):
+    if msg is None or not await is_logistics(msg.chat_id):
         return
-    text = msg.text or msg.caption or ""
-    image = None
-    if msg.photo:
-        f = await msg.photo[-1].get_file()
-        image = bytes(await f.download_as_bytearray())
-    if not image and len(text.strip()) < 8:
-        return  # "ok", "+", stiker va h.k.
-    await logistics.handle_message(msg.chat_id, msg.message_id, msg.date, text, image)
+    text = (msg.text or msg.caption or "").strip()
+    if len(text) < 8:
+        return  # izohsiz rasm, "ok", "+", stiker — hisobga olinmaydi
+    is_edit = update.edited_message is not None
+    old = await db.get_dispatch(msg.chat_id, msg.message_id) if is_edit else None
+    if is_edit and old and old["raw_text"] == text:
+        return
+    _, phone = split_phone(text)
+    wd = work_day(msg.date)
+    await db.upsert_raw(msg.chat_id, msg.message_id, msg.date, wd, text, phone)
+    status = await process(msg.chat_id, msg.message_id)
+    new = await db.get_dispatch(msg.chat_id, msg.message_id)
+
+    if status == "ok":
+        await react(ctx.bot, msg.chat_id, msg.message_id)
+        if wd is None:
+            await notify(ctx.bot, await db.admins(),
+                         f"⚠️ Jo‘natma 07:00–08:00 oralig‘ida yozildi — hech bir kunlik hisobotga "
+                         f"kirmaydi:\n{short(new)}")
+
+    if is_edit and old:
+        link = report._link(msg.chat_id, msg.message_id)
+        await notify(ctx.bot, await db.subscribers(),
+                     f"✏️ <b>Omborchi xabarni o‘zgartirdi</b> "
+                     f"({msg.date.astimezone(TZ):%d.%m %H:%M})\n"
+                     f"Avval: {short(old)}\nEndi: {short(new)}"
+                     + (f"\n<a href=\"{link}\">Xabarni ochish</a>" if link else ""))
+        if status != "failed":
+            await resend_day_if_closed(ctx.bot, wd, "xabar o‘zgartirildi")
 
 
-async def daily_report_job(ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = await db.get_setting("report_chat_id")
-    if not chat_id:
-        log.warning("Hisobot chati belgilanmagan — botga /hisobot_menga yozing")
+async def cmd_bekor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await is_logistics(msg.chat_id):
         return
-    text = await logistics.build_report(logistics.last_window_end_day())
-    await ctx.bot.send_message(int(chat_id), text, parse_mode=ParseMode.HTML)
+    target = msg.reply_to_message
+    if not target:
+        await msg.reply_text("Hisobotdan chiqariladigan xabarga javob (reply) qilib /bekor yozing.")
+        return
+    d = await db.get_dispatch(msg.chat_id, target.message_id)
+    if not d or d["status"] == "cancelled":
+        await msg.reply_text("Bu xabar hisobotda yo‘q.")
+        return
+    await db.set_status(msg.chat_id, target.message_id, "cancelled")
+    await react(ctx.bot, msg.chat_id, target.message_id, "👎")
+    await msg.reply_text("❌ Hisobotdan chiqarildi.")
+    who = escape(update.effective_user.full_name)
+    await notify(ctx.bot, await db.subscribers(),
+                 f"🗑 <b>{who}</b> jo‘natmani bekor qildi "
+                 f"({d['sent_at'].astimezone(TZ):%d.%m %H:%M}):\n{short(d)}")
+    await resend_day_if_closed(ctx.bot, d["work_day"], "jo‘natma bekor qilindi")
+
+
+# ================= jadval =================
+
+async def job_retry(ctx: ContextTypes.DEFAULT_TYPE):
+    """Gemini avval o'qiy olmagan xabarlarni qayta o'qish (har 10 daqiqa)."""
+    for d in await db.to_retry(MAX_ATTEMPTS):
+        status = await process(d["chat_id"], d["message_id"])
+        if status == "ok":
+            await react(ctx.bot, d["chat_id"], d["message_id"])
+            await resend_day_if_closed(ctx.bot, d["work_day"], "kechikib o‘qilgan xabar")
+        elif status == "failed" and d["attempts"] + 1 >= MAX_ATTEMPTS:
+            link = report._link(d["chat_id"], d["message_id"])
+            await notify(ctx.bot, await db.admins(),
+                         "⚠️ Gemini bu xabarni 2 soat davomida o‘qiy olmadi — hisobotga kirmaydi:\n"
+                         f"<i>{escape((d['raw_text'] or '')[:300])}</i>"
+                         + (f"\n<a href=\"{link}\">Xabar</a>" if link else ""))
+
+
+def due_reports(today: date) -> list[tuple[date, date, str]]:
+    """Bugun 07:00 da yuboriladigan hisobotlar ro'yxati."""
+    d = last_closed_day()
+    out = [(d, d, report.day_title(d))]
+    if today.weekday() == 0:
+        w1, w2 = last_week()
+        out.append((w1, w2, report.period_title(w1, w2, "Haftalik chiqim")))
+    if today.day in (1, 16):
+        h1, h2 = last_half()
+        out.append((h1, h2, report.period_title(h1, h2, "15 kunlik chiqim")))
+    if today.day == 1:
+        m1, m2 = last_month()
+        out.append((m1, m2, f"{report.OYLAR[m1.month].capitalize()} {m1.year} — oylik chiqim"))
+    return out
+
+
+async def job_reports(ctx: ContextTypes.DEFAULT_TYPE):
+    """Har kuni 07:00: kunlik; dushanba — haftalik; 16 va 1 — 15 kunlik; 1 — oylik."""
+    subs = await db.subscribers()
+    if not subs:
+        log.warning("Hisobot oluvchi yo'q")
+        return
+    for d1, d2, title in due_reports(datetime.now(TZ).date()):
+        for d in await db.unread_between(d1, d2):
+            await process(d["chat_id"], d["message_id"])
+        await send_summary(ctx.bot, await report.collect(d1, d2, title), subs)
+    if not await db.get_setting("logistics_chat_id"):
+        await notify(ctx.bot, await db.admins(),
+                     "⚠️ Logistika guruhi ulanmagan — botni guruhga qo‘shib, /guruh yozing.")
+
+
+# ================= ishga tushirish =================
+
+_last_alert = 0.0
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    global _last_alert
     if isinstance(ctx.error, Conflict):
-        log.error("Bot boshqa joyda ham ishlayapti — faqat bitta oynada ./run.sh qoldiring.")
+        log.error("Bot boshqa joyda ham ishlayapti — faqat bitta nusxani qoldiring.")
         return
     log.error("Xato: %s", ctx.error, exc_info=ctx.error)
+    if _time.time() - _last_alert > 600:          # 10 daqiqada ko'pi bilan bitta ogohlantirish
+        _last_alert = _time.time()
+        await notify(ctx.bot, await db.admins(), f"⚠️ Botda xato: <code>{escape(str(ctx.error))[:300]}</code>")
+
+
+async def post_init(app: Application):
+    await db.init()
+    await app.bot.set_my_commands([
+        ("hisobot", "Oxirgi kunlik hisobot"), ("bugun", "Joriy kun (hozirgacha)"),
+        ("hafta", "O‘tgan hafta"), ("yarim_oy", "Oxirgi 15 kun"), ("oy", "O‘tgan oy"),
+        ("obuna", "Avtomatik hisobotni yoqish/o‘chirish"), ("start", "Yordam"),
+    ])
 
 
 def _single_instance():
-    """Bir kompyuterda botning ikkinchi nusxasini ishga tushirmaslik."""
+    """Bir kompyuterda ikkinchi nusxani ishga tushirmaslik."""
     import fcntl
     lock = open(Path(__file__).with_name(".bot.lock"), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise SystemExit("Bot allaqachon boshqa terminal oynasida ishlayapti. "
-                         "Ikkinchisini ochish shart emas.")
+        raise SystemExit("Bot allaqachon boshqa oynada ishlayapti.")
     return lock
 
 
 def main():
     if not cfg.telegram_token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN .env faylida yo'q")
-    _lock = _single_instance()  # noqa: F841 — jarayon tugaguncha ushlab turiladi
-    app = Application.builder().token(cfg.telegram_token).post_init(post_init).build()
-    app.add_handler(CommandHandler(["start", "help"], start))
-    app.add_handler(CommandHandler("csv", cmd_csv))
-    app.add_handler(CommandHandler("kontragent", cmd_add_k))
-    app.add_handler(CommandHandler("kontragentlar", cmd_list_k))
-    app.add_handler(CommandHandler("kontragent_ochir", cmd_del_k))
-    app.add_handler(CommandHandler("guruh", cmd_guruh))
-    app.add_handler(CommandHandler("hisobot_menga", cmd_hisobot_menga))
-    app.add_handler(CommandHandler("hisobot", cmd_hisobot))
-    # Guruh xabarlari (yangi va tahrirlangan) — logistika uchun
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message))
-    # Shaxsiy chat — nakladnoy
+        raise SystemExit("TELEGRAM_BOT_TOKEN berilmagan")
+    _lock = _single_instance()  # noqa: F841
+    app = (Application.builder().token(cfg.telegram_token).post_init(post_init)
+           .concurrent_updates(4).build())
     private = filters.ChatType.PRIVATE
-    app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), on_photo))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
+    groups = filters.ChatType.GROUPS
+
+    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("hisobot", cmd_hisobot, private))
+    app.add_handler(CommandHandler("bugun", cmd_bugun, private))
+    app.add_handler(CommandHandler("hafta", cmd_hafta, private))
+    app.add_handler(CommandHandler("yarim_oy", cmd_yarim_oy, private))
+    app.add_handler(CommandHandler("oy", cmd_oy, private))
+    app.add_handler(CommandHandler("obuna", cmd_obuna, private))
+    app.add_handler(CommandHandler("foydalanuvchilar", cmd_users, private))
+    app.add_handler(CommandHandler("olib_tashlash", cmd_remove, private))
+    app.add_handler(CommandHandler("holat", cmd_holat, private))
+    app.add_handler(CommandHandler("guruh", cmd_guruh))
+    app.add_handler(CommandHandler("bekor", cmd_bekor, groups))
+    app.add_handler(CallbackQueryHandler(on_access_button, pattern=r"^(allow|deny):"))
+    app.add_handler(MessageHandler(groups & ~filters.COMMAND, on_group_message))
     app.add_error_handler(on_error)
-    app.job_queue.run_daily(daily_report_job, time=dtime(cfg.report_end_hour, 0, tzinfo=logistics.TZ),
-                            name="kunlik_hisobot")
+
+    app.job_queue.run_daily(job_reports, time=dtime(cfg.day_end_hour, 0, tzinfo=TZ), name="hisobotlar")
+    app.job_queue.run_repeating(job_retry, interval=600, first=60, name="qayta_oqish")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

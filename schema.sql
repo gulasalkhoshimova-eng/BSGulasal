@@ -1,56 +1,30 @@
-CREATE TABLE IF NOT EXISTS contractors (
-    id        SERIAL PRIMARY KEY,
-    name      TEXT NOT NULL,          -- 1C'dagi aniq nom
-    inn       TEXT,
-    contract  TEXT,                   -- "Договор № ..." to'liq matni
-    aliases   TEXT[] NOT NULL DEFAULT '{}',  -- nakladnoyda qanday yozilishi
-    UNIQUE (name)
-);
-
-CREATE TABLE IF NOT EXISTS invoices (
-    id             SERIAL PRIMARY KEY,
-    user_id        BIGINT NOT NULL,
-    doc_date       DATE,
-    doc_number     TEXT,
-    supplier_raw   TEXT,              -- nakladnoydan o'qilgan "Kimdan"
-    buyer_raw      TEXT,              -- "Kimga"
-    contractor_id  INT REFERENCES contractors(id),
-    total          NUMERIC(18,2),     -- nakladnoydagi "Итого"
-    comment        TEXT,
-    status         TEXT NOT NULL DEFAULT 'draft',  -- draft | confirmed | exported | cancelled
-    photo_file_id  TEXT,
-    raw_json       JSONB,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    exported_at    TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS invoice_items (
-    id          SERIAL PRIMARY KEY,
-    invoice_id  INT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-    line_no     INT NOT NULL,
-    name        TEXT NOT NULL,
-    unit        TEXT,
-    qty         NUMERIC(18,3) NOT NULL,
-    price       NUMERIC(18,2) NOT NULL,
-    amount      NUMERIC(18,2) NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices(status);
-
--- Logistika guruhidagi jo'natma xabarlari
-CREATE TABLE IF NOT EXISTS shipments (
+-- Logistika guruhidagi jo'natma xabarlari (1 xabar = 1 mashina)
+CREATE TABLE IF NOT EXISTS dispatches (
     chat_id      BIGINT NOT NULL,
     message_id   BIGINT NOT NULL,
     sent_at      TIMESTAMPTZ NOT NULL,
+    work_day     DATE,                 -- ish kuni (08:00->07:00); 07:00-08:00 oralig'i = NULL
     raw_text     TEXT,
-    parsed_ok    BOOLEAN NOT NULL DEFAULT false,   -- Gemini o'qidimi
-    is_shipment  BOOLEAN,
+    phone        TEXT,                 -- matndan lokal ajratiladi, Gemini'ga yuborilmaydi
+    status       TEXT NOT NULL DEFAULT 'pending',
+                 -- pending | ok | not_shipment | cancelled | failed
     parsed       JSONB,
+    attempts     INT NOT NULL DEFAULT 0,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (chat_id, message_id)
 );
-CREATE INDEX IF NOT EXISTS shipments_sent_idx ON shipments(sent_at);
+CREATE INDEX IF NOT EXISTS dispatches_day_idx ON dispatches(work_day);
 
--- Bot sozlamalari (logistika guruhi, hisobot chati)
+-- Bot foydalanuvchilari (hisobot oluvchilar)
+CREATE TABLE IF NOT EXISTS users (
+    user_id     BIGINT PRIMARY KEY,
+    name        TEXT,
+    role        TEXT NOT NULL DEFAULT 'user',   -- admin | user
+    subscribed  BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Sozlamalar (logistika guruhi ID va h.k.)
 CREATE TABLE IF NOT EXISTS settings (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL

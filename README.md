@@ -1,73 +1,70 @@
-# Nakladnoy → 1C CSV Telegram bot
+# Logistika hisobot boti
 
-Qo‘lda yozilgan yuk xati (накладная) rasmini Telegram’ga yuborasiz → Gemini o‘qiydi →
-siz tekshirib tasdiqlaysiz → kun oxirida `/csv` bilan bitta CSV olib 1C’ga yuklaysiz.
+Telegram’dagi logistika guruhida omborchi yozgan "mashina chiqdi" xabarlarini o‘qiydi
+(Gemini), PostgreSQL’ga yozadi va Excel hisobot yuboradi.
 
-## O‘rnatish (bir marta)
+| Hisobot | Qachon | Davr |
+|---|---|---|
+| Kunlik | har kuni 07:00 | kecha 08:00 → bugun 07:00 |
+| Haftalik | dushanba 07:00 | dushanba–yakshanba |
+| 15 kunlik | 16- va 1-sana 07:00 | 1–15 / 16–oy oxiri |
+| Oylik | 1-sana 07:00 | o‘tgan oy |
 
-1. **Homebrew** (parol so‘raydi, shuning uchun o‘zingiz ishga tushirasiz):
-   ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-   Oxirida ko‘rsatilgan `eval "$(/opt/homebrew/bin/brew shellenv)"` qatorini ham bajaring.
-2. **Python + PostgreSQL + kutubxonalar:**
-   ```bash
-   cd ~/Projects/nakladnoy-bot && chmod +x setup.sh run.sh && ./setup.sh
-   ```
-3. **Kalitlar** — `.env` faylini oching va to‘ldiring:
-   - `TELEGRAM_BOT_TOKEN` — Telegram’da @BotFather → /newbot
-   - `GEMINI_API_KEY` — https://aistudio.google.com/apikey
-4. Ishga tushirish: `./run.sh`. Botga `/start` yozing — u sizning ID’ingizni ko‘rsatadi.
-   Shu ID’ni `.env` dagi `ALLOWED_USER_IDS=` ga yozing va botni qayta ishga tushiring
-   (aks holda botdan har kim foydalana oladi).
+Excel varaqlari: **Xulosa** (o‘lchamlar bo‘yicha m³, jami, paddon, kley, rodgips),
+**Xaridorlar**, **Manzillar** (viloyat/tuman), **Mashinalar** (raqam, haydovchi, telefon,
+xabarga havola), **O‘qilmagan** (Gemini o‘qiy olmagan xabarlar).
 
-## Kundalik ish
+## Xabar namunasi (omborchi)
 
-1. Kontragentlarni bir marta kiriting (1C’dagi nom bilan aynan bir xil):
-   `/kontragent Nomi | INN | Договор № ... от ... | nakladnoyda yozilishi1, yozilishi2`
-2. Nakladnoy rasmini yuboring → tekshiring → ✅ yoki ✏️.
-3. `/csv` → fayl → 1C’ga yuklash.
+```
+70 B 275 YA
+Shafoatov Shahzod
++998946591422
+200x300x625 ...40,5m³
+18 paddon
+Gazablok kley
+40 qop
+Xojakbar mega qurilish mchj
+Surxondaryo denov
+```
 
-Bot qatorlarni tekshiradi: `soni × narx ≠ summa` yoki `Итого ≠ yig‘indi` bo‘lsa ogohlantiradi.
+Telefon raqam Gemini’ga yuborilmaydi — lokal ajratiladi va faqat Excel’da ko‘rinadi.
 
-## CSV formati
+## Sozlash (bir marta)
 
-`;` bilan ajratilgan, UTF-8 (BOM bilan), har tovar = bitta qator. Ustunlar
-`export_csv.py` dagi `COLUMNS` ro‘yxatida — 1C’dagi yuklash обработкаsi boshqa nom
-yoki tartib kutsa, faqat shu ro‘yxatni va `build_csv` dagi qatorni moslang.
+1. @BotFather → `/setprivacy` → bot → **Disable** (bot guruh xabarlarini ko‘rishi uchun).
+2. Botga shaxsiy chatda `/start` — **birinchi yozgan odam admin** bo‘ladi.
+3. Botni logistika guruhiga qo‘shing, guruhda `/guruh` yozing.
+4. Rahbar va yordamchi botga `/start` yozadi → adminga "✅ Ruxsat berish" tugmasi keladi.
 
-## Railway’ga deploy
+## Guruhda
 
-1. railway.com → **New Project → Deploy from GitHub repo** → shu repozitoriy.
-2. Shu loyihada **+ New → Database → PostgreSQL** qo‘shing.
-3. Bot servisi → **Variables**:
-   - `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `ALLOWED_USER_IDS`
-   - `GEMINI_MODEL=gemini-3.8-flash`
-   - `DATABASE_URL` → **Add Reference** → `Postgres.DATABASE_URL`
-4. Deploy. Loglarda `Application started` chiqsa — tayyor.
+- Bot o‘qigan jo‘natmaga 👍 qo‘yadi.
+- Xabar **tahrirlansa** — hamma hisobot oluvchilarga "avval / endi" ogohlantirish keladi,
+  hisobot yuborilgan kun bo‘lsa — yangilangan hisobot qayta yuboriladi.
+- Noto‘g‘ri xabarga **reply** qilib `/bekor` — hisobotdan chiqariladi (Telegram botlarga
+  o‘chirilgan xabar haqida xabar bermaydi, shuning uchun o‘chirish o‘rniga `/bekor`).
+- 07:00–08:00 oralig‘idagi jo‘natma hech bir kunga kirmaydi — admin ogohlantiriladi.
 
-⚠️ Railway’da ishga tushgach, kompyuterdagi botni to‘xtating (Ctrl+C) — bitta token
-bilan ikki joyda ishlasa Telegram `Conflict` xatosini beradi.
+## Buyruqlar (shaxsiy chat)
+
+`/hisobot`, `/hisobot 09.11.2026`, `/bugun`, `/hafta`, `/yarim_oy`, `/oy`, `/obuna`;
+admin: `/foydalanuvchilar`, `/olib_tashlash ID`, `/holat`.
+
+## Ishga tushirish
+
+Lokal: `./run.sh` (PostgreSQL ishlab turishi kerak).
+
+Railway: GitHub repo’dan deploy + PostgreSQL. Variables:
+`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.8-flash`,
+`DATABASE_URL=${{Postgres.DATABASE_URL}}`. Railway’da ishga tushgach lokal botni to‘xtating
+(bitta token — bitta nusxa).
 
 ## Fayllar
 
 | Fayl | Vazifa |
 |---|---|
-| `bot.py` | Telegram buyruqlari, tekshirish, tuzatish |
-| `ocr.py` | Gemini’ga rasm yuborish, JSON sxema |
+| `bot.py` | Telegram: guruh, buyruqlar, foydalanuvchilar, jadval |
+| `parser.py` | Gemini bilan xabarni o‘qish, telefonni yashirish, ish kuni |
+| `report.py` | Hisob-kitob, Excel, qisqa matn |
 | `db.py`, `schema.sql` | PostgreSQL |
-| `export_csv.py` | 1C uchun CSV |
-
-## Logistika: kunlik chiqim hisoboti
-
-Bot logistika guruhidagi "mashina chiqdi" xabarlarini o‘qiydi (Gemini) va har kuni
-**07:00** da kechagi 08:00 → bugungi 07:00 bo‘yicha hisobot yuboradi:
-o‘lchamlar bo‘yicha m³ va jami, kley (qop), paddon, xaridorlar bo‘yicha, manzillar.
-
-Sozlash (bir marta):
-1. @BotFather → `/setprivacy` → bot → **Disable** (aks holda bot guruh xabarlarini ko‘rmaydi).
-2. Botni logistika guruhiga qo‘shing va guruhda `/guruh` yozing.
-3. Botning shaxsiy chatida `/hisobot_menga` yozing.
-4. Istalgan payt: `/hisobot` yoki `/hisobot 09.11.2026`.
-
-m³: xabarda "kub/m3" bo‘lsa — shu olinadi; faqat dona bo‘lsa — o‘lcham (mm) × dona.

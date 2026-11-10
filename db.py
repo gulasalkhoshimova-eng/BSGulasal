@@ -1,11 +1,9 @@
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
-from rapidfuzz import fuzz, process
 
 from config import cfg
 
@@ -19,167 +17,116 @@ async def init():
         await c.execute(sql)
 
 
-# ---------- kontragentlar ----------
-
-async def add_contractor(name: str, inn: str | None, contract: str | None, aliases: list[str]):
+async def _one(q, args=()):
     async with pool.connection() as c:
-        await c.execute(
-            """INSERT INTO contractors (name, inn, contract, aliases) VALUES (%s,%s,%s,%s)
-               ON CONFLICT (name) DO UPDATE SET inn=EXCLUDED.inn, contract=EXCLUDED.contract,
-               aliases=EXCLUDED.aliases""",
-            (name, inn, contract, aliases),
-        )
+        return await (await c.execute(q, args)).fetchone()
 
 
-async def list_contractors() -> list[dict]:
+async def _all(q, args=()):
     async with pool.connection() as c:
-        return await (await c.execute("SELECT * FROM contractors ORDER BY name")).fetchall()
+        return await (await c.execute(q, args)).fetchall()
 
 
-async def delete_contractor(cid: int) -> bool:
+async def _exec(q, args=()):
     async with pool.connection() as c:
-        cur = await c.execute("DELETE FROM contractors WHERE id=%s", (cid,))
-        return cur.rowcount > 0
-
-
-async def match_contractor(text: str) -> dict | None:
-    """Nakladnoydagi 'Kimdan' matnini 1C kontragentiga moslash (taxminiy)."""
-    rows = await list_contractors()
-    choices = {}
-    for r in rows:
-        for v in [r["name"], *r["aliases"]]:
-            choices[v] = r
-    if not choices or not text:
-        return None
-    best = process.extractOne(text, list(choices), scorer=fuzz.token_set_ratio)
-    if best and best[1] >= 75:
-        return choices[best[0]]
-    return None
-
-
-# ---------- nakladnoylar ----------
-
-async def save_invoice(user_id, inv, contractor_id, photo_file_id, raw: dict) -> int:
-    async with pool.connection() as c, c.transaction():
-        row = await (await c.execute(
-            """INSERT INTO invoices (user_id, doc_date, doc_number, supplier_raw, buyer_raw,
-                   contractor_id, total, photo_file_id, raw_json)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-            (user_id, inv["date"], inv["number"] or None, inv["supplier"], inv["buyer"],
-             contractor_id, inv["total"], photo_file_id, Jsonb(raw)),
-        )).fetchone()
-        await _write_items(c, row["id"], inv["items"])
-        return row["id"]
-
-
-async def _write_items(c, invoice_id, items):
-    await c.execute("DELETE FROM invoice_items WHERE invoice_id=%s", (invoice_id,))
-    for i, it in enumerate(items, 1):
-        await c.execute(
-            """INSERT INTO invoice_items (invoice_id, line_no, name, unit, qty, price, amount)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-            (invoice_id, i, it["name"], it["unit"], it["qty"], it["price"], it["amount"]),
-        )
-
-
-async def replace_items(invoice_id: int, items: list[dict]):
-    async with pool.connection() as c, c.transaction():
-        await _write_items(c, invoice_id, items)
-
-
-async def get_invoice(invoice_id: int) -> dict | None:
-    async with pool.connection() as c:
-        inv = await (await c.execute(
-            """SELECT i.*, k.name AS k_name, k.inn AS k_inn, k.contract AS k_contract
-               FROM invoices i LEFT JOIN contractors k ON k.id=i.contractor_id WHERE i.id=%s""",
-            (invoice_id,),
-        )).fetchone()
-        if inv:
-            inv["items"] = await (await c.execute(
-                "SELECT * FROM invoice_items WHERE invoice_id=%s ORDER BY line_no", (invoice_id,)
-            )).fetchall()
-        return inv
-
-
-async def update_invoice(invoice_id: int, **fields):
-    allowed = {"doc_date", "doc_number", "contractor_id", "total", "comment", "status"}
-    fields = {k: v for k, v in fields.items() if k in allowed}
-    if not fields:
-        return
-    sets = ", ".join(f"{k}=%s" for k in fields)
-    async with pool.connection() as c:
-        await c.execute(f"UPDATE invoices SET {sets} WHERE id=%s", (*fields.values(), invoice_id))
-
-
-async def pending_export(user_id: int, day: date | None) -> list[dict]:
-    """Tasdiqlangan, hali eksport qilinmagan nakladnoylar."""
-    q = "SELECT id FROM invoices WHERE user_id=%s AND status='confirmed'"
-    args: list = [user_id]
-    if day:
-        q += " AND created_at::date=%s"
-        args.append(day)
-    async with pool.connection() as c:
-        ids = [r["id"] for r in await (await c.execute(q + " ORDER BY id", args)).fetchall()]
-    return [await get_invoice(i) for i in ids]
-
-
-async def mark_exported(ids: list[int]):
-    async with pool.connection() as c:
-        await c.execute(
-            "UPDATE invoices SET status='exported', exported_at=now() WHERE id = ANY(%s)", (ids,)
-        )
-
-
-def items_sum(items) -> Decimal:
-    return sum((Decimal(str(i["amount"])) for i in items), Decimal(0))
+        await c.execute(q, args)
 
 
 # ---------- sozlamalar ----------
 
 async def get_setting(key: str) -> str | None:
-    async with pool.connection() as c:
-        r = await (await c.execute("SELECT value FROM settings WHERE key=%s", (key,))).fetchone()
-        return r["value"] if r else None
+    r = await _one("SELECT value FROM settings WHERE key=%s", (key,))
+    return r["value"] if r else None
 
 
 async def set_setting(key: str, value: str):
+    await _exec("INSERT INTO settings (key, value) VALUES (%s,%s) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (key, value))
+
+
+# ---------- foydalanuvchilar ----------
+
+async def get_user(uid: int) -> dict | None:
+    return await _one("SELECT * FROM users WHERE user_id=%s", (uid,))
+
+
+async def has_admin() -> bool:
+    return bool(await _one("SELECT 1 FROM users WHERE role='admin' LIMIT 1"))
+
+
+async def add_user(uid: int, name: str | None, role: str = "user"):
+    await _exec("""INSERT INTO users (user_id, name, role) VALUES (%s,%s,%s)
+                   ON CONFLICT (user_id) DO UPDATE SET name=COALESCE(EXCLUDED.name, users.name)""",
+                (uid, name, role))
+
+
+async def remove_user(uid: int) -> bool:
     async with pool.connection() as c:
-        await c.execute(
-            "INSERT INTO settings (key, value) VALUES (%s,%s) "
-            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (key, value))
+        cur = await c.execute("DELETE FROM users WHERE user_id=%s AND role<>'admin'", (uid,))
+        return cur.rowcount > 0
 
 
-# ---------- logistika ----------
-
-async def upsert_shipment_raw(chat_id, message_id, sent_at, text):
-    """Yangi yoki tahrirlangan xabar: matn yangilanadi va qayta o'qish uchun belgilanadi."""
-    async with pool.connection() as c:
-        await c.execute(
-            """INSERT INTO shipments (chat_id, message_id, sent_at, raw_text)
-               VALUES (%s,%s,%s,%s)
-               ON CONFLICT (chat_id, message_id) DO UPDATE
-               SET raw_text=EXCLUDED.raw_text, parsed_ok=false""",
-            (chat_id, message_id, sent_at, text))
+async def set_subscribed(uid: int, on: bool):
+    await _exec("UPDATE users SET subscribed=%s WHERE user_id=%s", (on, uid))
 
 
-async def save_shipment_parsed(chat_id, message_id, is_shipment: bool, parsed):
-    async with pool.connection() as c:
-        await c.execute(
-            """UPDATE shipments SET parsed_ok=true, is_shipment=%s, parsed=%s
-               WHERE chat_id=%s AND message_id=%s""",
-            (is_shipment, parsed, chat_id, message_id))
+async def list_users() -> list[dict]:
+    return await _all("SELECT * FROM users ORDER BY role, created_at")
 
 
-async def unparsed_shipments(start, end) -> list[dict]:
-    async with pool.connection() as c:
-        return await (await c.execute(
-            "SELECT * FROM shipments WHERE NOT parsed_ok AND sent_at >= %s AND sent_at < %s",
-            (start, end))).fetchall()
+async def subscribers() -> list[int]:
+    return [r["user_id"] for r in await _all("SELECT user_id FROM users WHERE subscribed")]
 
 
-async def shipments_between(start, end) -> list[dict]:
-    async with pool.connection() as c:
-        return await (await c.execute(
-            """SELECT * FROM shipments WHERE parsed_ok AND is_shipment
-               AND sent_at >= %s AND sent_at < %s ORDER BY sent_at""",
-            (start, end))).fetchall()
+async def admins() -> list[int]:
+    return [r["user_id"] for r in await _all("SELECT user_id FROM users WHERE role='admin'")]
+
+
+# ---------- jo'natmalar ----------
+
+async def get_dispatch(chat_id: int, message_id: int) -> dict | None:
+    return await _one("SELECT * FROM dispatches WHERE chat_id=%s AND message_id=%s",
+                      (chat_id, message_id))
+
+
+async def upsert_raw(chat_id, message_id, sent_at, work_day, text, phone):
+    """Yangi yoki tahrirlangan xabar: qayta o'qish uchun 'pending' bo'ladi."""
+    await _exec(
+        """INSERT INTO dispatches (chat_id, message_id, sent_at, work_day, raw_text, phone)
+           VALUES (%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (chat_id, message_id) DO UPDATE
+           SET raw_text=EXCLUDED.raw_text, phone=EXCLUDED.phone, status='pending',
+               attempts=0, updated_at=now()""",
+        (chat_id, message_id, sent_at, work_day, text, phone))
+
+
+async def save_parsed(chat_id, message_id, status: str, parsed: dict | None):
+    await _exec("""UPDATE dispatches SET status=%s, parsed=%s, updated_at=now()
+                   WHERE chat_id=%s AND message_id=%s""",
+                (status, Jsonb(parsed) if parsed is not None else None, chat_id, message_id))
+
+
+async def mark_failed(chat_id, message_id):
+    await _exec("""UPDATE dispatches SET status='failed', attempts=attempts+1, updated_at=now()
+                   WHERE chat_id=%s AND message_id=%s""", (chat_id, message_id))
+
+
+async def set_status(chat_id, message_id, status: str):
+    await _exec("UPDATE dispatches SET status=%s, updated_at=now() "
+                "WHERE chat_id=%s AND message_id=%s", (status, chat_id, message_id))
+
+
+async def to_retry(max_attempts: int = 12) -> list[dict]:
+    return await _all("""SELECT * FROM dispatches
+                         WHERE status IN ('pending','failed') AND attempts < %s
+                         ORDER BY sent_at""", (max_attempts,))
+
+
+async def unread_between(d1: date, d2: date) -> list[dict]:
+    return await _all("""SELECT * FROM dispatches WHERE status IN ('pending','failed')
+                         AND work_day BETWEEN %s AND %s ORDER BY sent_at""", (d1, d2))
+
+
+async def ok_between(d1: date, d2: date) -> list[dict]:
+    return await _all("""SELECT * FROM dispatches WHERE status='ok'
+                         AND work_day BETWEEN %s AND %s ORDER BY sent_at""", (d1, d2))
